@@ -20,6 +20,7 @@ from torch.fx.experimental.symbolic_shapes import (
     SymTypes,
 )
 from torch.utils._mode_utils import no_dispatch
+from torch.utils._pytree import tree_flatten
 
 from .._dynamo import config as dynamo_config
 
@@ -33,6 +34,7 @@ from .exc import (
 from .ir import Constant, FixedLayout, InputBuffer, Pointwise, Reduction, TensorBox
 from .lowering import (
     FALLBACK_ALLOW_LIST,
+    fallback_handler,
     layout_constraints,
     lowerings,
     make_fallback,
@@ -65,6 +67,36 @@ def supported_dtype_of_cpp_wrapper(dtype):
         # torch.float16, # TODO: implement this
     }
     return dtype in supported_dtype
+
+
+def fallback_output(t):
+    return t.is_cpu and config.disable_cpp_codegen
+
+
+def fallback_node_due_to_unsupported_type(node: torch.fx.Node):
+    def check_skip_condition(node, is_output):
+        if not isinstance(node, torch.fx.Node):
+            return False
+
+        if "val" not in node.meta:
+            return False
+
+        for meta in tree_flatten(node.meta["val"])[0]:
+            if not isinstance(meta, torch._subclasses.FakeTensor):
+                continue
+
+            if is_output:
+                if fallback_output(meta):
+                    return True
+
+        return False
+
+    # only skip codegen if there is a cpu output, not input
+    for arg in tree_flatten((node.args, node.kwargs))[0]:
+        if check_skip_condition(arg, is_output=False):
+            return True
+
+    return check_skip_condition(node, is_output=True)
 
 
 def is_magic_method(op):
@@ -371,6 +403,10 @@ class GraphLowering(torch.fx.Interpreter):
     def get_attr(self, target, args, kwargs):
         # this is a constant
         value = getattr(self.module, target)
+
+        if fallback_output(value):
+            return self.add_tensor_constant(value)
+
         with no_dispatch():
             if value.shape == ():
                 return Constant(value.item(), value.dtype, value.device)
@@ -438,8 +474,11 @@ class GraphLowering(torch.fx.Interpreter):
             args, kwargs = self.fetch_args_kwargs_from_env(n)
             origins |= gather_origins(args, kwargs)
         with ir.IRNode.current_origins(origins):
-            if n.op == "call_function" and n.target in layout_constraints:
-                args, kwargs = self.fetch_args_kwargs_from_env(n)
+            if n.op == "call_function" and fallback_node_due_to_unsupported_type(n):
+                result = fallback_handler(n.target, add_to_fallback_set=False)(
+                    *args, **kwargs
+                )
+            elif n.op == "call_function" and n.target in layout_constraints:
                 args, kwargs = layout_constraints[n.target](n, *args, **kwargs)
                 result = self.call_function(n.target, args, kwargs)
             elif is_magic_method(n.target):
@@ -527,6 +566,10 @@ class GraphLowering(torch.fx.Interpreter):
 
         return result
 
+    def check_cpp_codegen_disabled(self):
+        if config.disable_cpp_codegen:
+            self.disable_cpp_wrapper("cpp codegen disabled")
+
     def check_platform(self):
         if sys.platform != "linux":
             self.disable_cpp_wrapper("platform not linux")
@@ -548,6 +591,7 @@ class GraphLowering(torch.fx.Interpreter):
             self.disable_cpp_wrapper("Constants")
 
     def check_cpp_wrapper(self):
+        self.check_cpp_codegen_disabled()
         self.check_platform()
         self.check_device_for_cpp_buffer()
         self.check_input_for_cpp_buffer()
